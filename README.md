@@ -5,59 +5,6 @@
 [![Matrix](https://img.shields.io/badge/Matrix-Server-green.svg)](https://matrix.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-blue.svg)](https://docs.docker.com/compose/)
 
-## 🎯 What's Included
-
-This repository provides a complete, battle-tested solution for deploying Matrix Synapse:
-
-- ✅ **Matrix Synapse** - Main homeserver
-- ✅ **Element Web** - Modern web client  
-- ✅ **PostgreSQL** - Reliable database backend
-- ✅ **Nginx** - Web proxy with SSL/TLS
-- ✅ **Let's Encrypt** - Automatic SSL certificates
-- ✅ **Admin Tools** - Comprehensive management utilities
-- ✅ **Health Monitoring** - System status and diagnostics
-- ✅ **Backup/Restore** - Data protection utilities
-
-## 🌟 Key Features
-
-### 🛠️ **Problem-Free Deployment**
-- Handles all common YAML configuration errors
-- Resolves Docker Compose volume conflicts
-- Fixes domain migration issues
-- Automatic database initialization
-- Smart SSL certificate management
-
-### 🔧 **Production Ready**
-- Health checks and monitoring
-- Automatic service recovery
-- Security headers and best practices
-- Comprehensive logging
-- Performance optimizations
-
-### 📱 **Client Support**
-- Web client (Element Web)
-- Mobile apps (iOS/Android)
-- Desktop clients
-- Third-party clients via standard Matrix API
-
-## 📋 Prerequisites
-
-### System Requirements
-- **Operating System**: Ubuntu 20.04+ / Debian 11+
-- **Memory**: Minimum 2GB RAM (4GB recommended)
-- **Storage**: 20GB+ available disk space
-- **CPU**: 2+ cores recommended
-
-### Network Requirements
-- **Domain**: Registered domain pointing to your server
-- **Ports**: 80, 443, 8448 accessible from internet
-- **DNS**: A record configured for your domain
-
-### Software Dependencies
-- **Docker**: Version 20.10+
-- **Docker Compose**: Version 1.29+
-- **Root access** to the server
-
 ## ⚡ Quick Start
 
 ### 1. Install Docker (if not already installed)
