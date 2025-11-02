@@ -1,6 +1,6 @@
 # 🚀 Matrix Synapse - Complete Deployment Solution
 
-> Professional-grade Matrix Synapse deployment scripts that handle all edge cases and common issues
+> Matrix Synapse deployment scripts
 
 [![Matrix](https://img.shields.io/badge/Matrix-Server-green.svg)](https://matrix.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-blue.svg)](https://docs.docker.com/compose/)
