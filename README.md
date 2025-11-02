@@ -2,7 +2,6 @@
 
 > Professional-grade Matrix Synapse deployment scripts that handle all edge cases and common issues
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Matrix](https://img.shields.io/badge/Matrix-Server-green.svg)](https://matrix.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-blue.svg)](https://docs.docker.com/compose/)
 
@@ -82,7 +81,7 @@ docker-compose --version
 
 ```bash
 # Download the deployment script
-wget https://raw.githubusercontent.com//deploy-matrix-complete.sh
+wget https://raw.githubusercontent.com/D0n7T0uchM3/matrix_docker-compose/refs/heads/main/deploy-matrix-complete.sh
 chmod +x deploy-matrix-complete.sh
 
 # Run deployment (replace with your domain and email)
@@ -103,7 +102,7 @@ After deployment (5-10 minutes), you'll have:
 ### Download Management Script
 
 ```bash
-wget https://raw.githubusercontent.com/[your-repo]/matrix-manager.sh
+wget https://raw.githubusercontent.com/D0n7T0uchM3/matrix_docker-compose/refs/heads/main/matrix-manager.sh
 chmod +x matrix-manager.sh
 ```
 
@@ -436,18 +435,6 @@ sudo docker-compose pull
 sudo docker-compose up -d
 ```
 
-### Major Version Upgrades
-1. **Create backup** before upgrading
-2. **Read release notes** for breaking changes
-3. **Test in staging** if possible
-4. **Update gradually** in production
-
-### Database Migrations
-Synapse handles database migrations automatically, but always:
-1. **Backup before upgrade**
-2. **Check logs** after upgrade
-3. **Verify functionality**
-
 ## 🆘 Support & Community
 
 ### Official Resources
@@ -463,14 +450,6 @@ Synapse handles database migrations automatically, but always:
 ### Professional Support
 - **Element Matrix Services**: https://element.io/matrix-services
 - **Managed Hosting**: Available from various providers
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## 🙏 Acknowledgments
 
