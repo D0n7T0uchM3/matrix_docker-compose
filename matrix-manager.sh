@@ -34,6 +34,53 @@ check_root() {
     fi
 }
 
+# Auto-detect or prompt for domain
+detect_domain() {
+    if [ -z "$DOMAIN" ]; then
+        info "Domain not configured, attempting auto-detection..."
+        
+        # Try to get domain from homeserver.yaml
+        if [ -f "$MATRIX_DIR/synapse_data/homeserver.yaml" ]; then
+            DETECTED_DOMAIN=$(grep "^server_name:" "$MATRIX_DIR/synapse_data/homeserver.yaml" | head -1 | sed 's/server_name:[[:space:]]*"\?\([^"]*\)"\?/\1/' | tr -d '"' | tr -d "'" | xargs)
+            
+            if [ -n "$DETECTED_DOMAIN" ]; then
+                # Remove http:// or https:// prefix if present
+                DETECTED_DOMAIN=$(echo "$DETECTED_DOMAIN" | sed 's|^https\?://||')
+                DOMAIN="$DETECTED_DOMAIN"
+                success "Domain auto-detected: $DOMAIN"
+                return 0
+            fi
+        fi
+        
+        # Try to get from running container
+        if docker ps --format '{{.Names}}' | grep -q "synapse-app"; then
+            DETECTED_DOMAIN=$(docker exec synapse-app cat /data/homeserver.yaml 2>/dev/null | grep "^server_name:" | head -1 | sed 's/server_name:[[:space:]]*"\?\([^"]*\)"\?/\1/' | tr -d '"' | tr -d "'" | xargs)
+            
+            if [ -n "$DETECTED_DOMAIN" ]; then
+                # Remove http:// or https:// prefix if present
+                DETECTED_DOMAIN=$(echo "$DETECTED_DOMAIN" | sed 's|^https\?://||')
+                DOMAIN="$DETECTED_DOMAIN"
+                success "Domain auto-detected from container: $DOMAIN"
+                return 0
+            fi
+        fi
+        
+        # If auto-detection failed, prompt user
+        error "Could not auto-detect domain"
+        echo -n "Please enter your Matrix server domain: "
+        read DOMAIN
+        
+        if [ -z "$DOMAIN" ]; then
+            error "Domain cannot be empty"
+            exit 1
+        fi
+        
+        # Remove http:// or https:// prefix if present
+        DOMAIN=$(echo "$DOMAIN" | sed 's|^https\?://||')
+        info "Using domain: $DOMAIN"
+    fi
+}
+
 # Check if in Matrix directory
 check_directory() {
     if [ ! -d "$MATRIX_DIR" ] || [ ! -f "$MATRIX_DIR/docker-compose.yml" ]; then
@@ -74,24 +121,43 @@ user_create() {
     
     cat > /tmp/create_user << EOF
 $username
-
 $password
 $password
 $is_admin
 EOF
     
-    if timeout 30 docker exec -i synapse-app register_new_matrix_user -c /data/homeserver.yaml http://localhost:8008 < /tmp/create_user >/dev/null 2>&1; then
+    log "Attempting to register user with Synapse..."
+    
+    # Try to create user and capture output
+    if OUTPUT=$(timeout 30 docker exec -i synapse-app register_new_matrix_user -c /data/homeserver.yaml http://localhost:8008 < /tmp/create_user 2>&1); then
         success "User @$username:$DOMAIN created successfully"
         if [ "$is_admin" = "yes" ]; then
             success "User granted administrator privileges"
         fi
         info "User can now login at: $(get_server_url)"
+        rm -f /tmp/create_user
+        return 0
     else
-        error "Failed to create user. Check if username already exists or server is accessible"
-        docker-compose logs --tail=5 synapse-app
+        error "Failed to create user"
+        
+        # Check for specific error messages
+        if echo "$OUTPUT" | grep -qi "user.*already exists"; then
+            warning "User @$username:$DOMAIN already exists"
+        elif echo "$OUTPUT" | grep -qi "connection"; then
+            error "Cannot connect to Synapse server"
+            info "Check if Synapse is running: sudo docker-compose ps"
+        elif echo "$OUTPUT" | grep -qi "password.*weak\|password.*short"; then
+            error "Password is too weak or too short"
+        else
+            error "Error details:"
+            echo "$OUTPUT" | tail -5
+        fi
+        
+        info "Recent Synapse logs:"
+        docker-compose logs --tail=5 synapse-app 2>/dev/null | tail -3 || warning "Could not fetch logs"
+        rm -f /tmp/create_user
+        return 1
     fi
-    
-    rm -f /tmp/create_user
 }
 
 user_list() {
@@ -526,6 +592,7 @@ show_help() {
 main() {
     check_root
     check_directory
+    detect_domain
     
     case "$1" in
         "user")
