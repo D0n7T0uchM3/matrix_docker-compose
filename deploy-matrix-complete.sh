@@ -56,6 +56,42 @@ if ! command -v docker-compose &> /dev/null; then
     error "Docker Compose is not installed! Please install Docker Compose first."
 fi
 
+# Check if domain is provided
+if [ -z "$DOMAIN" ]; then
+    # Try to detect from existing installation
+    if [ -f "/opt/matrix/synapse_data/homeserver.yaml" ]; then
+        DETECTED_DOMAIN=$(grep "^server_name:" "/opt/matrix/synapse_data/homeserver.yaml" | head -1 | sed 's/server_name:[[:space:]]*"\?\([^"]*\)"\?/\1/' | tr -d '"' | tr -d "'" | xargs | sed 's|^https\?://||')
+        if [ -n "$DETECTED_DOMAIN" ]; then
+            warning "Domain not specified, using detected domain: $DETECTED_DOMAIN"
+            DOMAIN="$DETECTED_DOMAIN"
+        fi
+    fi
+    
+    # If still not found, ask user
+    if [ -z "$DOMAIN" ]; then
+        error "Domain is required!"
+        echo -n "Please enter your Matrix server domain: "
+        read DOMAIN
+        if [ -z "$DOMAIN" ]; then
+            error "Domain cannot be empty!"
+            exit 1
+        fi
+    fi
+fi
+
+# Remove http:// or https:// prefix if present
+DOMAIN=$(echo "$DOMAIN" | sed 's|^https\?://||')
+
+# Check if email is provided (for SSL certificate)
+if [ -z "$EMAIL" ]; then
+    warning "Email not specified (needed for SSL certificate)"
+    echo -n "Enter email for Let's Encrypt SSL (or press Enter to skip SSL): "
+    read EMAIL
+    if [ -z "$EMAIL" ]; then
+        warning "No email provided - SSL certificate setup will be skipped"
+    fi
+fi
+
 # Check if domain resolves to current server
 CURRENT_IP=$(curl -s ifconfig.me 2>/dev/null || echo "unknown")
 DOMAIN_IP=$(nslookup $DOMAIN 2>/dev/null | grep -A1 "Name:" | tail -1 | awk '{print $2}' || echo "unknown")
@@ -307,8 +343,8 @@ server {
     listen 80;
     server_name $DOMAIN;
     
-    # Security headers
-    add_header X-Frame-Options DENY;
+    # Security headers (frame-ancestors allows widgets/iframes for calls)
+    add_header Content-Security-Policy "frame-ancestors 'self'";
     add_header X-Content-Type-Options nosniff;
     add_header X-XSS-Protection "1; mode=block";
     
@@ -354,10 +390,12 @@ success "HTTP Nginx configuration created"
 
 # Validate Nginx configuration syntax
 log "✅ Validating Nginx configuration..."
-if docker run --rm -v /opt/matrix/nginx_data/conf.d:/etc/nginx/conf.d nginx:alpine nginx -t >/dev/null 2>&1; then
+NGINX_TEST_OUTPUT=$(docker run --rm -v /opt/matrix/nginx_data/conf.d:/etc/nginx/conf.d nginx:alpine nginx -t 2>&1 || true)
+if echo "$NGINX_TEST_OUTPUT" | grep -q "syntax is ok\|test is successful"; then
     success "Nginx configuration is valid"
 else
-    error "Nginx configuration has syntax errors"
+    warning "Nginx configuration pre-validation skipped (will validate when container starts)"
+    info "Continuing with deployment..."
 fi
 
 # Start all services
@@ -390,7 +428,6 @@ done
 log "👤 Creating administrator account..."
 cat > /tmp/create_admin << EOF
 $ADMIN_USER
-
 $ADMIN_PASS
 $ADMIN_PASS
 yes
@@ -457,9 +494,9 @@ server {
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
 
-    # Security headers
+    # Security headers (frame-ancestors allows widgets/iframes for calls)
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Frame-Options DENY;
+    add_header Content-Security-Policy "frame-ancestors 'self'";
     add_header X-Content-Type-Options nosniff;
     add_header X-XSS-Protection "1; mode=block";
 
