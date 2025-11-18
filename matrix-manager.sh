@@ -403,6 +403,381 @@ backup_restore() {
     system_status
 }
 
+# Domain management functions
+domain_change() {
+    local new_domain=$1
+    local email=$2
+    
+    info "Current domain: $DOMAIN"
+    
+    # Prompt for new domain if not provided
+    if [ -z "$new_domain" ]; then
+        read -p "Enter new domain: " new_domain
+        if [ -z "$new_domain" ]; then
+            error "Domain cannot be empty"
+            return 1
+        fi
+    fi
+    
+    # Remove http:// or https:// prefix
+    new_domain=$(echo "$new_domain" | sed 's|^https\?://||')
+    
+    if [ "$DOMAIN" = "$new_domain" ]; then
+        warning "New domain is the same as current domain!"
+        return 0
+    fi
+    
+    # Prompt for email if not provided
+    if [ -z "$email" ]; then
+        read -p "Enter email for SSL certificate (or press Enter to skip): " email
+    fi
+    
+    echo ""
+    warning "═══════════════════════════════════════════════════════════"
+    warning "                    IMPORTANT NOTICE                        "
+    warning "═══════════════════════════════════════════════════════════"
+    echo ""
+    echo -e "${RED}Matrix's server_name is IMMUTABLE and cannot be changed!${NC}"
+    echo ""
+    echo "You have TWO options:"
+    echo ""
+    echo -e "${YELLOW}Option 1: WEB DOMAIN CHANGE ONLY (RECOMMENDED)${NC}"
+    echo "  - Changes web URL and SSL certificate"
+    echo "  - Server identity stays: @user:$DOMAIN"
+    echo "  - Federation continues to work"
+    echo "  - No data loss"
+    echo "  - Users keep their accounts"
+    echo ""
+    echo -e "${RED}Option 2: COMPLETE REINSTALL (DATA LOSS)${NC}"
+    echo "  - Completely new server with new domain"
+    echo "  - Server identity becomes: @user:$new_domain"
+    echo "  - ALL DATA AND USERS WILL BE LOST"
+    echo "  - Federation identity changes"
+    echo "  - Requires user account recreation"
+    echo ""
+    
+    # Ask user which option
+    read -p "Choose option (1 or 2): " option
+    
+    case $option in
+        1)
+            domain_change_web "$new_domain" "$email"
+            ;;
+        2)
+            domain_change_complete "$new_domain" "$email"
+            ;;
+        *)
+            error "Invalid option. Please choose 1 or 2"
+            return 1
+            ;;
+    esac
+}
+
+domain_change_web() {
+    local new_domain=$1
+    local email=$2
+    
+    echo ""
+    info "This will change:"
+    echo "  ✓ Web URL: $DOMAIN → $new_domain"
+    echo "  ✓ SSL certificates"
+    echo "  ✓ Nginx configuration"
+    echo "  ✗ Server identity stays: @user:$DOMAIN"
+    echo ""
+    warning "Users will still see @user:$DOMAIN in their Matrix IDs"
+    warning "But they'll access the web interface at https://$new_domain"
+    echo ""
+    read -p "Continue with web domain change? (y/N): " confirm
+    
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        info "Operation cancelled"
+        return 0
+    fi
+    
+    # Create backup
+    log "Creating backup before domain change..."
+    local backup_name="matrix-backup-domain-change-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p /opt/$backup_name
+    
+    docker exec synapse-db pg_dump -U synapse synapse > /opt/$backup_name/database.sql 2>/dev/null || {
+        error "Backup failed"
+        return 1
+    }
+    cp -r synapse_data element_data nginx_data docker-compose.yml /opt/$backup_name/
+    tar -czf /opt/$backup_name.tar.gz -C /opt $(basename $backup_name)
+    rm -rf /opt/$backup_name
+    
+    success "Backup created: /opt/$backup_name.tar.gz"
+    
+    # Stop nginx
+    log "Stopping nginx for SSL certificate..."
+    docker-compose stop nginx
+    sleep 5
+    
+    # Get new SSL certificate
+    local ssl_success=false
+    if [ -n "$email" ]; then
+        log "Obtaining SSL certificate for $new_domain..."
+        if docker run -it --rm --name certbot \
+          -v "/opt/letsencrypt:/etc/letsencrypt" \
+          -p 80:80 \
+          certbot/certbot certonly --standalone \
+          --non-interactive \
+          --agree-tos --email $email \
+          -d $new_domain; then
+            success "SSL certificate obtained for $new_domain"
+            ssl_success=true
+        else
+            warning "Failed to obtain SSL certificate - will configure for HTTP"
+        fi
+    else
+        warning "No email provided - skipping SSL setup"
+    fi
+    
+    # Update Nginx configuration
+    log "Updating Nginx configuration..."
+    if [ "$ssl_success" = true ]; then
+        # HTTPS configuration
+        tee nginx_data/conf.d/matrix.conf > /dev/null << EOF
+# HTTP redirect to HTTPS
+server {
+    listen 80;
+    server_name $new_domain;
+    
+    location /.well-known/acme-challenge/ {
+        root /usr/share/nginx/html;
+        allow all;
+    }
+    
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+# HTTPS server
+server {
+    listen 443 ssl http2;
+    listen 8448 ssl http2;
+    server_name $new_domain;
+
+    ssl_certificate /etc/letsencrypt/live/$new_domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$new_domain/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+
+    location / {
+        proxy_pass http://element;
+        proxy_redirect off;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location ~ ^(/_matrix|/_synapse/client) {
+        proxy_pass http://synapse-app:8008;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        client_max_body_size 100M;
+        
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+    }
+}
+EOF
+        local proto="https"
+    else
+        # HTTP only configuration
+        tee nginx_data/conf.d/matrix.conf > /dev/null << EOF
+server {
+    listen 80;
+    server_name $new_domain;
+    
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    
+    location / {
+        proxy_pass http://element;
+        proxy_redirect off;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location ~ ^(/_matrix|/_synapse/client) {
+        proxy_pass http://synapse-app:8008;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        client_max_body_size 100M;
+        
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+    }
+}
+EOF
+        local proto="http"
+    fi
+    success "Nginx configuration updated"
+    
+    # Update Element configuration
+    log "Updating Element Web configuration..."
+    tee element_data/config.json > /dev/null << EOF
+{
+    "default_server_config": {
+        "m.homeserver": {
+            "base_url": "$proto://$new_domain",
+            "server_name": "$DOMAIN"
+        }
+    },
+    "brand": "Element",
+    "integrations_ui_url": "https://scalar.vector.im/",
+    "integrations_rest_url": "https://scalar.vector.im/api",
+    "integrations_widgets_urls": [
+        "https://scalar.vector.im/_matrix/integrations/v1"
+    ],
+    "default_federate": true,
+    "default_theme": "light",
+    "show_labs_settings": true,
+    "features": {
+        "feature_pinning": "labs",
+        "feature_custom_status": "labs"
+    },
+    "room_directory": {
+        "servers": ["matrix.org"]
+    },
+    "enable_presence_by_hs_url": {
+        "https://matrix.org": false
+    },
+    "setting_defaults": {
+        "breadcrumbs": true
+    }
+}
+EOF
+    success "Element configuration updated"
+    
+    # Start services
+    log "Starting services..."
+    docker-compose start nginx
+    sleep 10
+    
+    # Verify
+    log "Verifying services..."
+    if curl -s -k $proto://$new_domain/_matrix/client/versions >/dev/null 2>&1; then
+        success "Matrix API is accessible at $proto://$new_domain"
+    else
+        warning "Matrix API check failed - services may still be starting"
+    fi
+    
+    echo ""
+    success "═══════════════════════════════════════════════════════════"
+    success "         WEB DOMAIN CHANGE COMPLETED                        "
+    success "═══════════════════════════════════════════════════════════"
+    echo ""
+    info "Web Interface: $proto://$new_domain"
+    info "Matrix Server ID: $DOMAIN (unchanged)"
+    info "User IDs: @username:$DOMAIN"
+    echo ""
+    info "Backup saved: /opt/$backup_name.tar.gz"
+    echo ""
+    warning "IMPORTANT: Update DNS A record for $new_domain to point to this server"
+    echo ""
+}
+
+domain_change_complete() {
+    local new_domain=$1
+    local email=$2
+    
+    echo ""
+    error "═══════════════════════════════════════════════════════════"
+    error "         COMPLETE REINSTALL - FINAL WARNING                 "
+    error "═══════════════════════════════════════════════════════════"
+    echo ""
+    warning "This will:"
+    echo "  ✗ DELETE all user accounts"
+    echo "  ✗ DELETE all rooms and messages"
+    echo "  ✗ DELETE all media files"
+    echo "  ✗ RESET federation identity"
+    echo "  ✓ Create fresh install with domain: $new_domain"
+    echo ""
+    read -p "Type the new domain '$new_domain' to confirm: " confirm_domain
+    
+    if [ "$confirm_domain" != "$new_domain" ]; then
+        info "Domain mismatch - operation cancelled"
+        return 0
+    fi
+    
+    # Create final backup
+    log "Creating FINAL backup before reinstall..."
+    local backup_name="matrix-backup-before-reinstall-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p /opt/$backup_name
+    
+    docker exec synapse-db pg_dump -U synapse synapse > /opt/$backup_name/database.sql 2>/dev/null || true
+    cp -r synapse_data element_data nginx_data docker-compose.yml /opt/$backup_name/ 2>/dev/null || true
+    tar -czf /opt/$backup_name.tar.gz -C /opt $(basename $backup_name)
+    rm -rf /opt/$backup_name
+    
+    success "Final backup created: /opt/$backup_name.tar.gz"
+    
+    # Stop and remove everything
+    log "Stopping and removing all services..."
+    docker-compose down
+    docker stop nginx synapse-app synapse-admin element synapse-db 2>/dev/null || true
+    docker rm -f nginx synapse-app synapse-admin element synapse-db 2>/dev/null || true
+    
+    # Delete all data
+    log "Deleting all data..."
+    rm -rf pgsql_data synapse_data element_data nginx_data
+    
+    success "Old installation removed"
+    
+    # Check if deploy script exists
+    local deploy_script=""
+    if [ -f "./deploy-matrix-complete.sh" ]; then
+        deploy_script="./deploy-matrix-complete.sh"
+    elif [ -f "/root/deploy-matrix-complete.sh" ]; then
+        deploy_script="/root/deploy-matrix-complete.sh"
+    fi
+    
+    if [ -n "$deploy_script" ] && [ -f "$deploy_script" ]; then
+        log "Running deployment script with new domain..."
+        bash $deploy_script $new_domain $email
+    else
+        warning "Deployment script not found!"
+        info "Please run: sudo ./deploy-matrix-complete.sh $new_domain $email"
+    fi
+    
+    echo ""
+    success "Complete reinstall finished"
+    info "Your Matrix server now uses domain: $new_domain"
+    info "New user IDs will be: @username:$new_domain"
+    info "Old backup saved: /opt/$backup_name.tar.gz"
+    echo ""
+}
+
 # SSL management functions
 ssl_setup() {
     local email=${1:-$(read -p "Enter email for Let's Encrypt: " && echo $REPLY)}
@@ -566,6 +941,9 @@ show_help() {
     echo "  system restart                              - Restart all services"
     echo "  system update                               - Update container images"
     echo ""
+    echo "Domain Management:"
+    echo "  domain change [new-domain] [email]         - Change server domain"
+    echo ""
     echo "Backup & Restore:"
     echo "  backup create                               - Create system backup"
     echo "  backup restore [backup-file]               - Restore from backup"
@@ -582,6 +960,7 @@ show_help() {
     echo "Examples:"
     echo "  $0 user create alice password123 no"
     echo "  $0 system status"
+    echo "  $0 domain change newdomain.com admin@newdomain.com"
     echo "  $0 backup create"
     echo "  $0 ssl setup admin@example.com"
     echo "  $0 logs view nginx 100"
@@ -611,6 +990,12 @@ main() {
                 "restart") system_restart ;;
                 "update") system_update ;;
                 *) echo "Unknown system action: $2"; show_help ;;
+            esac
+            ;;
+        "domain")
+            case "$2" in
+                "change") domain_change "$3" "$4" ;;
+                *) echo "Unknown domain action: $2"; show_help ;;
             esac
             ;;
         "backup")
