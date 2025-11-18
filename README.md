@@ -85,6 +85,27 @@ sudo ./matrix-manager.sh system update
 sudo ./matrix-manager.sh system stop
 ```
 
+### Domain Management
+
+```bash
+# Change domain (interactive - guides you through options)
+sudo ./matrix-manager.sh domain change
+
+# Change domain with parameters
+sudo ./matrix-manager.sh domain change newdomain.com your-email@newdomain.com
+
+# Option 1: Web domain change only (RECOMMENDED)
+#   - Changes web URL and SSL certificate
+#   - Keeps Matrix server identity (@user:old-domain.com)
+#   - No data loss, users keep accounts
+#   - Federation continues to work
+
+# Option 2: Complete reinstall (DATA LOSS)
+#   - Fresh install with new domain
+#   - New Matrix identity (@user:new-domain.com)
+#   - ALL data and users are deleted
+```
+
 ### Backup & Restore
 
 ```bash
@@ -190,7 +211,33 @@ curl -s ifconfig.me
 # Solution: Update DNS A record to point to server IP
 ```
 
-#### 2. **SSL certificate fails**
+#### 2. **Need to change domain name**
+```bash
+# Use the domain change tool
+sudo ./matrix-manager.sh domain change
+
+# Important: Matrix server_name is IMMUTABLE
+# You have two options:
+
+# Option 1 (RECOMMENDED): Web domain change only
+#   - Change web URL: old.com → new.com
+#   - User IDs stay: @user:old.com
+#   - No data loss
+#   - Automatic backup created
+
+# Option 2: Complete reinstall
+#   - New domain: new.com
+#   - New user IDs: @user:new.com
+#   - ALL DATA DELETED
+#   - Fresh start
+
+# After domain change:
+# 1. Update DNS A record for new domain
+# 2. Wait for DNS propagation (up to 48h)
+# 3. Verify: curl https://new-domain.com/_matrix/client/versions
+```
+
+#### 3. **SSL certificate fails**
 ```bash
 # Check domain accessibility
 curl -I http://your-domain.com
@@ -205,7 +252,7 @@ sudo docker run -it --rm --name certbot \
   -d your-domain.com
 ```
 
-#### 3. **Container keeps restarting**
+#### 4. **Container keeps restarting**
 ```bash
 # Check specific service logs
 sudo docker-compose logs synapse-app
@@ -215,7 +262,7 @@ sudo docker-compose logs nginx
 sudo ./deploy-matrix-complete.sh your-domain.com your-email@domain.com
 ```
 
-#### 4. **Database connection issues**
+#### 5. **Database connection issues**
 ```bash
 # Check database status
 sudo docker-compose exec synapse-db pg_isready -U synapse
@@ -226,7 +273,7 @@ sudo rm -rf /opt/matrix/pgsql_data/*
 sudo docker-compose up -d synapse-db
 ```
 
-#### 5. **Performance issues**
+#### 6. **Performance issues**
 ```bash
 # Check resource usage
 sudo docker stats
@@ -417,6 +464,9 @@ sudo ./deploy-matrix-complete.sh domain.com email@domain.com
 
 # System status
 sudo ./matrix-manager.sh system status
+
+# Change domain
+sudo ./matrix-manager.sh domain change newdomain.com email@newdomain.com
 
 # Create user
 sudo ./matrix-manager.sh user create username password no
