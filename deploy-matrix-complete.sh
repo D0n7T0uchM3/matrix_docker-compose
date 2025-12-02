@@ -52,8 +52,15 @@ if ! command -v docker &> /dev/null; then
     error "Docker is not installed! Please install Docker first."
 fi
 
-if ! command -v docker-compose &> /dev/null; then
+if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
     error "Docker Compose is not installed! Please install Docker Compose first."
+fi
+
+# Use docker compose or docker-compose
+if docker compose version &> /dev/null; then
+    DOCKER_COMPOSE="docker compose"
+else
+    DOCKER_COMPOSE="docker-compose"
 fi
 
 # Check if domain is provided
@@ -69,12 +76,10 @@ if [ -z "$DOMAIN" ]; then
     
     # If still not found, ask user
     if [ -z "$DOMAIN" ]; then
-        error "Domain is required!"
         echo -n "Please enter your Matrix server domain: "
         read DOMAIN
         if [ -z "$DOMAIN" ]; then
             error "Domain cannot be empty!"
-            exit 1
         fi
     fi
 fi
@@ -93,12 +98,33 @@ if [ -z "$EMAIL" ]; then
 fi
 
 # Check if domain resolves to current server
-CURRENT_IP=$(curl -s ifconfig.me 2>/dev/null || echo "unknown")
-DOMAIN_IP=$(nslookup $DOMAIN 2>/dev/null | grep -A1 "Name:" | tail -1 | awk '{print $2}' || echo "unknown")
+CURRENT_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || curl -s --connect-timeout 5 icanhazip.com 2>/dev/null || echo "unknown")
+DOMAIN_IP=""
 
-if [ "$CURRENT_IP" != "unknown" ] && [ "$DOMAIN_IP" != "unknown" ] && [ "$CURRENT_IP" != "$DOMAIN_IP" ]; then
-    warning "Domain $DOMAIN resolves to $DOMAIN_IP but server IP is $CURRENT_IP"
-    warning "Make sure your DNS A record points to this server's IP"
+# Try multiple methods to resolve domain
+if command -v dig &> /dev/null; then
+    DOMAIN_IP=$(dig +short $DOMAIN 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+elif command -v getent &> /dev/null; then
+    DOMAIN_IP=$(getent hosts $DOMAIN 2>/dev/null | awk '{print $1}' | head -1)
+elif command -v nslookup &> /dev/null; then
+    DOMAIN_IP=$(nslookup $DOMAIN 2>/dev/null | grep -A1 "Name:" | tail -1 | awk '{print $2}')
+fi
+
+if [ -n "$CURRENT_IP" ] && [ "$CURRENT_IP" != "unknown" ]; then
+    info "Server public IP: $CURRENT_IP"
+fi
+
+if [ -n "$DOMAIN_IP" ]; then
+    info "Domain $DOMAIN resolves to: $DOMAIN_IP"
+    if [ "$CURRENT_IP" != "unknown" ] && [ "$CURRENT_IP" != "$DOMAIN_IP" ]; then
+        warning "Domain $DOMAIN resolves to $DOMAIN_IP but server IP is $CURRENT_IP"
+        warning "Make sure your DNS A record points to this server's IP: $CURRENT_IP"
+        echo ""
+        read -p "Continue anyway? (y/N): " continue_anyway
+        if [ "$continue_anyway" != "y" ] && [ "$continue_anyway" != "Y" ]; then
+            error "Deployment cancelled. Please fix DNS first."
+        fi
+    fi
 fi
 
 log "🚀 Starting Matrix Synapse deployment for domain: $DOMAIN"
@@ -111,24 +137,23 @@ cd $MATRIX_DIR
 
 # Complete cleanup of old data
 log "🧹 Performing complete cleanup of old data..."
-docker-compose down 2>/dev/null || true
+$DOCKER_COMPOSE down 2>/dev/null || true
 docker stop nginx synapse-app synapse-admin element synapse-db 2>/dev/null || true
 docker rm -f nginx synapse-app synapse-admin element synapse-db 2>/dev/null || true
-docker volume prune -f || true
-docker network prune -f || true
+docker volume prune -f 2>/dev/null || true
+docker network prune -f 2>/dev/null || true
 rm -rf pgsql_data synapse_data element_data nginx_data
 success "Old data cleaned up"
 
 # Create directory structure
 log "📂 Creating directory structure..."
 mkdir -p {pgsql_data,synapse_data,element_data,nginx_data/conf.d}
+mkdir -p /opt/letsencrypt
 success "Directory structure created"
 
-# Create docker-compose.yml
+# Create docker-compose.yml (without deprecated version field)
 log "🐳 Creating docker-compose.yml configuration..."
 tee docker-compose.yml > /dev/null << EOF
-version: '3.8'
-
 services:
   synapse-db:
     image: docker.io/postgres:15-alpine
@@ -184,6 +209,11 @@ services:
       - ./element_data/config.json:/app/config.json
     networks:
       - matrix-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   nginx:
     image: nginx:alpine
@@ -193,6 +223,8 @@ services:
     depends_on:
       synapse-app:
         condition: service_healthy
+      element:
+        condition: service_healthy
     environment:
       TZ: "UTC"
     ports:
@@ -201,7 +233,7 @@ services:
       - "8448:8448"
     volumes:
       - ./nginx_data/conf.d:/etc/nginx/conf.d
-      - /opt/letsencrypt:/etc/letsencrypt
+      - /opt/letsencrypt:/etc/letsencrypt:ro
     networks:
       - matrix-network
 
@@ -213,12 +245,12 @@ success "Docker Compose configuration created"
 
 # Start PostgreSQL for initialization
 log "🐘 Starting PostgreSQL database..."
-docker-compose up -d synapse-db
+$DOCKER_COMPOSE up -d synapse-db
 log "⏳ Waiting for PostgreSQL initialization..."
 
 # Wait for PostgreSQL to be ready
 for i in {1..30}; do
-    if docker-compose exec -T synapse-db pg_isready -U synapse >/dev/null 2>&1; then
+    if $DOCKER_COMPOSE exec -T synapse-db pg_isready -U synapse >/dev/null 2>&1; then
         success "PostgreSQL is ready"
         break
     fi
@@ -231,31 +263,30 @@ done
 
 # Verify database is empty
 log "🔍 Verifying database state..."
-TABLE_COUNT=$(docker-compose exec -T synapse-db psql -U synapse -d synapse -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
+TABLE_COUNT=$($DOCKER_COMPOSE exec -T synapse-db psql -U synapse -d synapse -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
 if [ "$TABLE_COUNT" != "0" ] && [ "$TABLE_COUNT" != "" ]; then
     warning "Database contains $TABLE_COUNT tables - performing full cleanup"
-    docker-compose down
+    $DOCKER_COMPOSE down
     rm -rf pgsql_data/*
-    docker-compose up -d synapse-db
+    $DOCKER_COMPOSE up -d synapse-db
     sleep 20
 fi
 success "Database is clean and ready"
 
 # Generate Synapse configuration
 log "⚙️ Generating Synapse configuration..."
-docker run -it --rm \
+docker run --rm \
   -v ./synapse_data:/data \
   -e SYNAPSE_SERVER_NAME=$DOMAIN \
   -e SYNAPSE_REPORT_STATS=no \
   matrixdotorg/synapse:latest generate
 success "Synapse configuration generated"
 
-# Fix database configuration in homeserver.yaml
-log "🔧 Configuring PostgreSQL connection..."
+# Fix database configuration and add x_forwarded in homeserver.yaml
+log "🔧 Configuring PostgreSQL connection and reverse proxy settings..."
 python3 << 'PYTHON_EOF'
 import re
 import sys
-import yaml
 
 try:
     config_file = '/opt/matrix/synapse_data/homeserver.yaml'
@@ -280,13 +311,18 @@ try:
     pattern = r'database:.*?(?=^[a-zA-Z]|\Z)'
     new_content = re.sub(pattern, database_config + '\n\n', content, flags=re.MULTILINE | re.DOTALL)
 
+    # Add x_forwarded: true for reverse proxy support (critical for Jitsi/widgets)
+    # Find the listeners section and add x_forwarded after type: http
+    if 'x_forwarded:' not in new_content:
+        new_content = re.sub(
+            r'(type: http)',
+            r'\1\n    x_forwarded: true',
+            new_content
+        )
+
     # Write back the configuration
     with open(config_file, 'w') as f:
         f.write(new_content)
-
-    # Validate YAML syntax
-    with open(config_file, 'r') as f:
-        yaml.safe_load(f)
 
     print("SUCCESS")
 except Exception as e:
@@ -295,18 +331,26 @@ except Exception as e:
 PYTHON_EOF
 
 if [ $? -eq 0 ]; then
-    success "PostgreSQL configuration updated and validated"
+    success "PostgreSQL and reverse proxy configuration updated"
 else
-    error "Failed to update database configuration"
+    error "Failed to update configuration"
 fi
 
-# Create Element Web configuration (HTTP first)
+# Verify x_forwarded is set
+if grep -q "x_forwarded: true" synapse_data/homeserver.yaml; then
+    success "Reverse proxy headers (x_forwarded) configured"
+else
+    warning "x_forwarded not found - adding manually..."
+    sed -i 's/type: http/type: http\n    x_forwarded: true/' synapse_data/homeserver.yaml
+fi
+
+# Create Element Web configuration (will be updated to HTTPS if SSL succeeds)
 log "🌐 Creating Element Web configuration..."
 tee element_data/config.json > /dev/null << EOF
 {
     "default_server_config": {
         "m.homeserver": {
-            "base_url": "http://$DOMAIN",
+            "base_url": "https://$DOMAIN",
             "server_name": "$DOMAIN"
         }
     },
@@ -316,6 +360,9 @@ tee element_data/config.json > /dev/null << EOF
     "integrations_widgets_urls": [
         "https://scalar.vector.im/_matrix/integrations/v1"
     ],
+    "jitsi": {
+        "preferred_domain": "meet.element.io"
+    },
     "default_federate": true,
     "default_theme": "light",
     "show_labs_settings": true,
@@ -336,21 +383,84 @@ tee element_data/config.json > /dev/null << EOF
 EOF
 success "Element Web configuration created"
 
-# Create initial HTTP Nginx configuration
-log "🌐 Creating initial HTTP Nginx configuration..."
-tee nginx_data/conf.d/matrix.conf > /dev/null << EOF
+# Attempt to get SSL certificate BEFORE starting services
+SSL_SUCCESS=false
+if [ -n "$EMAIL" ]; then
+    log "🔒 Attempting to get SSL certificate..."
+    
+    # Make sure port 80 is free
+    $DOCKER_COMPOSE down 2>/dev/null || true
+    
+    if docker run --rm --name certbot \
+      -v "/opt/letsencrypt:/etc/letsencrypt" \
+      -p 80:80 \
+      certbot/certbot certonly --standalone \
+      --non-interactive \
+      --agree-tos --email $EMAIL \
+      -d $DOMAIN 2>&1; then
+        
+        # Verify certificate was created
+        if [ -f "/opt/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+            SSL_SUCCESS=true
+            success "SSL certificate obtained successfully"
+        else
+            warning "Certbot ran but certificate not found"
+        fi
+    else
+        warning "Failed to obtain SSL certificate"
+        info "Common causes: DNS not pointing to this server, port 80 blocked, rate limits"
+    fi
+else
+    warning "No email provided - skipping SSL setup"
+fi
+
+# Create Nginx configuration based on SSL status
+log "🌐 Creating Nginx configuration..."
+
+if [ "$SSL_SUCCESS" = true ]; then
+    # HTTPS configuration
+    tee nginx_data/conf.d/matrix.conf > /dev/null << EOF
+# HTTP redirect to HTTPS
 server {
     listen 80;
     server_name $DOMAIN;
     
-    # Security headers (frame-ancestors allows widgets/iframes for calls)
-    add_header Content-Security-Policy "frame-ancestors 'self'";
+    # Let's Encrypt challenge
+    location /.well-known/acme-challenge/ {
+        root /usr/share/nginx/html;
+        allow all;
+    }
+    
+    # Redirect all other traffic to HTTPS
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+# HTTPS server
+server {
+    listen 443 ssl http2;
+    listen 8448 ssl http2;
+    server_name $DOMAIN;
+
+    # SSL configuration
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "frame-ancestors 'self' https://*.element.io https://app.element.io";
     add_header X-Content-Type-Options nosniff;
     add_header X-XSS-Protection "1; mode=block";
-    
+
     # Element Web client
     location / {
-        proxy_pass http://element;
+        proxy_pass http://element:8080;
         proxy_redirect off;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -362,7 +472,68 @@ server {
     location ~ ^(/_matrix|/_synapse/client) {
         proxy_pass http://synapse-app:8008;
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # File upload limit
+        client_max_body_size 100M;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Timeout settings
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+    }
+
+    # Well-known for Matrix server discovery
+    location /.well-known/matrix/server {
+        default_type application/json;
+        return 200 '{"m.server": "$DOMAIN:443"}';
+    }
+
+    location /.well-known/matrix/client {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin *;
+        return 200 '{"m.homeserver": {"base_url": "https://$DOMAIN"}}';
+    }
+}
+EOF
+    PROTO="https"
+    success "HTTPS Nginx configuration created"
+else
+    # HTTP-only configuration
+    tee nginx_data/conf.d/matrix.conf > /dev/null << EOF
+server {
+    listen 80;
+    listen 8448;
+    server_name $DOMAIN;
+    
+    # Security headers
+    add_header Content-Security-Policy "frame-ancestors 'self' https://*.element.io https://app.element.io";
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    
+    # Element Web client
+    location / {
+        proxy_pass http://element:8080;
+        proxy_redirect off;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # Matrix Synapse API
+    location ~ ^(/_matrix|/_synapse/client) {
+        proxy_pass http://synapse-app:8008;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         
         # File upload limit
@@ -384,40 +555,47 @@ server {
         root /usr/share/nginx/html;
         allow all;
     }
+
+    # Well-known for Matrix server discovery
+    location /.well-known/matrix/server {
+        default_type application/json;
+        return 200 '{"m.server": "$DOMAIN:8448"}';
+    }
+
+    location /.well-known/matrix/client {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin *;
+        return 200 '{"m.homeserver": {"base_url": "http://$DOMAIN"}}';
+    }
 }
 EOF
-success "HTTP Nginx configuration created"
-
-# Validate Nginx configuration syntax
-log "✅ Validating Nginx configuration..."
-NGINX_TEST_OUTPUT=$(docker run --rm -v /opt/matrix/nginx_data/conf.d:/etc/nginx/conf.d nginx:alpine nginx -t 2>&1 || true)
-if echo "$NGINX_TEST_OUTPUT" | grep -q "syntax is ok\|test is successful"; then
-    success "Nginx configuration is valid"
-else
-    warning "Nginx configuration pre-validation skipped (will validate when container starts)"
-    info "Continuing with deployment..."
+    PROTO="http"
+    # Update Element config for HTTP
+    sed -i 's|https://|http://|g' element_data/config.json
+    success "HTTP Nginx configuration created"
 fi
 
 # Start all services
 log "🚀 Starting all services..."
-docker-compose up -d
+$DOCKER_COMPOSE up -d
 log "⏳ Waiting for all services to start (60 seconds)..."
 sleep 60
 
 # Check service status
 log "🔍 Checking service status..."
-docker-compose ps
+$DOCKER_COMPOSE ps
 
 # Wait for Synapse to be ready
 log "⏳ Waiting for Synapse to be ready..."
 for i in {1..30}; do
-    if curl -s http://localhost/_matrix/client/versions >/dev/null 2>&1; then
+    if curl -s http://localhost:8008/_matrix/client/versions >/dev/null 2>&1 || \
+       docker exec synapse-app curl -s http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
         success "Synapse is ready and responding"
         break
     fi
     if [ $i -eq 30 ]; then
         warning "Synapse may not be ready yet, but continuing..."
-        docker-compose logs --tail=10 synapse-app
+        $DOCKER_COMPOSE logs --tail=10 synapse-app
         break
     fi
     log "Attempt $i/30, waiting 10 more seconds..."
@@ -442,124 +620,18 @@ else
 fi
 rm -f /tmp/create_admin
 
-# Attempt to get SSL certificate
-log "🔒 Attempting to get SSL certificate..."
-docker-compose stop nginx
-sleep 5
-
-SSL_SUCCESS=false
-if docker run -it --rm --name certbot \
-  -v "/opt/letsencrypt:/etc/letsencrypt" \
-  -p 80:80 \
-  certbot/certbot certonly --standalone \
-  --non-interactive \
-  --agree-tos --email $EMAIL \
-  -d $DOMAIN >/dev/null 2>&1; then
-    
-    SSL_SUCCESS=true
-    success "SSL certificate obtained successfully"
-    
-    # Update nginx configuration for HTTPS
-    log "🔒 Updating Nginx configuration for HTTPS..."
-    tee nginx_data/conf.d/matrix.conf > /dev/null << EOF
-# HTTP redirect to HTTPS
-server {
-    listen 80;
-    server_name $DOMAIN;
-    
-    # Let's Encrypt challenge
-    location /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        allow all;
-    }
-    
-    # Redirect all other traffic to HTTPS
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-# HTTPS server
-server {
-    listen 443 ssl http2;
-    listen 8448 ssl http2;  # Matrix federation port
-    server_name $DOMAIN;
-
-    # SSL configuration
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-
-    # Security headers (frame-ancestors allows widgets/iframes for calls)
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header Content-Security-Policy "frame-ancestors 'self'";
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
-
-    # Element Web client
-    location / {
-        proxy_pass http://element;
-        proxy_redirect off;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    # Matrix Synapse API
-    location ~ ^(/_matrix|/_synapse/client) {
-        proxy_pass http://synapse-app:8008;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$remote_addr;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        
-        # File upload limit
-        client_max_body_size 100M;
-        
-        # WebSocket support for sync
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        
-        # Timeout settings
-        proxy_connect_timeout 600s;
-        proxy_send_timeout 600s;
-        proxy_read_timeout 600s;
-    }
-}
-EOF
-
-    # Update Element configuration for HTTPS
-    sed -i 's|http://|https://|g' element_data/config.json
-    
-    success "HTTPS configuration updated"
-else
-    warning "Failed to obtain SSL certificate - continuing with HTTP"
-    info "You can manually get SSL certificate later or check DNS configuration"
-fi
-
-# Start nginx
-docker-compose start nginx
-sleep 10
-
 # Final system verification
 log "🔍 Performing final system verification..."
 
-# Check HTTP/HTTPS availability
+# Check endpoint availability
 if [ "$SSL_SUCCESS" = true ]; then
-    PROTO="https"
-    if curl -k -s https://$DOMAIN/_matrix/client/versions >/dev/null 2>&1; then
+    if curl -k -s https://localhost/_matrix/client/versions >/dev/null 2>&1; then
         success "HTTPS is working correctly"
     else
-        warning "HTTPS endpoint may not be ready yet"
+        warning "HTTPS endpoint check via localhost failed (may work externally)"
     fi
 else
-    PROTO="http"
-    if curl -s http://$DOMAIN/_matrix/client/versions >/dev/null 2>&1; then
+    if curl -s http://localhost/_matrix/client/versions >/dev/null 2>&1; then
         success "HTTP is working correctly"
     else
         warning "HTTP endpoint may not be ready yet"
@@ -568,7 +640,7 @@ fi
 
 # Final container status
 log "📊 Final container status:"
-docker-compose ps
+$DOCKER_COMPOSE ps
 
 # Display success message and instructions
 echo ""
@@ -579,7 +651,9 @@ echo ""
 echo "🌐 Access your Matrix server:"
 echo "   Element Web:    $PROTO://$DOMAIN"
 echo "   Matrix API:     $PROTO://$DOMAIN/_matrix/client/versions"
-echo "   Federation:     https://$DOMAIN:8448 (if SSL enabled)"
+if [ "$SSL_SUCCESS" = true ]; then
+    echo "   Federation:     https://$DOMAIN:8448"
+fi
 echo ""
 echo "👤 Administrator account:"
 echo "   Username:  @$ADMIN_USER:$DOMAIN"
@@ -587,10 +661,10 @@ echo "   Password:  $ADMIN_PASS"
 echo ""
 echo "🔧 System management:"
 echo "   Directory:     $MATRIX_DIR"
-echo "   Status:        sudo docker-compose ps"
-echo "   Logs:          sudo docker-compose logs"
-echo "   Restart:       sudo docker-compose restart"
-echo "   Stop:          sudo docker-compose down"
+echo "   Status:        cd $MATRIX_DIR && sudo $DOCKER_COMPOSE ps"
+echo "   Logs:          cd $MATRIX_DIR && sudo $DOCKER_COMPOSE logs"
+echo "   Restart:       cd $MATRIX_DIR && sudo $DOCKER_COMPOSE restart"
+echo "   Stop:          cd $MATRIX_DIR && sudo $DOCKER_COMPOSE down"
 echo ""
 echo "📱 Mobile clients:"
 echo "   1. Install 'Element' from App Store/Google Play"
@@ -602,14 +676,14 @@ echo ""
 if [ "$SSL_SUCCESS" = true ]; then
     echo "🔒 SSL: Enabled and working"
     echo "🔄 SSL Auto-renewal (add to cron):"
-    echo "   0 2 * * * docker run --rm --name certbot -v /opt/letsencrypt:/etc/letsencrypt certbot/certbot renew --quiet && cd $MATRIX_DIR && docker-compose restart nginx"
+    echo "   0 2 * * * docker run --rm -v /opt/letsencrypt:/etc/letsencrypt certbot/certbot renew --quiet && cd $MATRIX_DIR && $DOCKER_COMPOSE restart nginx"
 else
     echo "⚠️  SSL: Not configured (running on HTTP)"
-    echo "🔒 To enable SSL later:"
-    echo "   1. Ensure DNS A record points to this server"
-    echo "   2. sudo docker-compose stop nginx"
-    echo "   3. sudo docker run -it --rm --name certbot -v /opt/letsencrypt:/etc/letsencrypt -p 80:80 certbot/certbot certonly --standalone --agree-tos --email $EMAIL -d $DOMAIN"
-    echo "   4. Update nginx configuration and restart"
+    echo "🔒 To enable SSL later, run:"
+    echo "   cd $MATRIX_DIR"
+    echo "   sudo $DOCKER_COMPOSE stop nginx"
+    echo "   sudo docker run --rm -v /opt/letsencrypt:/etc/letsencrypt -p 80:80 certbot/certbot certonly --standalone --agree-tos --email YOUR_EMAIL -d $DOMAIN"
+    echo "   # Then update nginx config for HTTPS and restart"
 fi
 
 echo ""
@@ -617,7 +691,7 @@ echo "🛡️  Security recommendations:"
 echo "   1. Change the default admin password via Element Web"
 echo "   2. Configure firewall: sudo ufw allow 80,443,8448/tcp"
 echo "   3. Regular backups of $MATRIX_DIR"
-echo "   4. Monitor logs: sudo docker-compose logs -f"
+echo "   4. Monitor logs: cd $MATRIX_DIR && sudo $DOCKER_COMPOSE logs -f"
 echo ""
 echo "✅ Your Matrix Synapse server is ready to use!"
 echo "🔗 Documentation: https://matrix.org/docs/"

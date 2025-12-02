@@ -8,6 +8,7 @@
 #   sudo ./matrix-manager.sh backup create
 
 DOMAIN=""
+WEB_DOMAIN=""
 MATRIX_DIR="/opt/matrix"
 
 # Colors for output
@@ -285,6 +286,96 @@ system_update() {
     
     success "Matrix Synapse updated successfully"
     system_status
+}
+
+system_recreate() {
+    log "Recreating Matrix services (Clean restart)..."
+    warning "This will stop services, remove containers, and start them again."
+    warning "This helps fix network issues after IP changes."
+    read -p "Continue? (y/N): " confirm
+    
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        info "Cancelled"
+        return
+    fi
+
+    docker-compose down
+    sleep 2
+    docker-compose up -d
+    
+    log "Waiting for services to initialize..."
+    sleep 30
+    
+    system_status
+}
+
+troubleshoot() {
+    echo -e "${CYAN}🔍 Running Troubleshooting Diagnostics${NC}"
+    echo "========================================"
+    
+    # 1. DNS Check
+    local my_ip=$(curl -s ifconfig.me 2>/dev/null)
+    info "Server Public IP: $my_ip"
+    
+    local dns_ip=""
+    if command -v dig >/dev/null; then
+        dns_ip=$(dig +short $DOMAIN | head -1)
+    elif command -v getent >/dev/null; then
+        dns_ip=$(getent hosts $DOMAIN | awk '{print $1}' | head -1)
+    else
+        dns_ip=$(ping -c 1 $DOMAIN 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+    fi
+    
+    info "Domain ($DOMAIN) resolves to: ${dns_ip:-"Unknown"}"
+    
+    if [ -n "$my_ip" ] && [ -n "$dns_ip" ]; then
+        if [ "$my_ip" != "$dns_ip" ]; then
+            error "DNS IP ($dns_ip) does NOT match Server IP ($my_ip)"
+            warning "Please update your DNS A record for $DOMAIN to $my_ip"
+            warning "This is likely causing your connection issues."
+        else
+            success "DNS records match Server IP"
+        fi
+    else
+        warning "Could not verify DNS (tools missing or network issue)"
+    fi
+    
+    # 2. Check x_forwarded
+    echo ""
+    info "Checking Synapse configuration..."
+    if [ -f "synapse_data/homeserver.yaml" ]; then
+        if grep -q "x_forwarded: true" synapse_data/homeserver.yaml; then
+            success "Reverse proxy headers configured (x_forwarded: true)"
+        else
+            warning "Reverse proxy headers NOT configured (missing x_forwarded: true)"
+            warning "This often causes Jitsi/Element redirects and auth failures."
+            read -p "Apply fix? (y/N): " fix
+            if [ "$fix" == "y" ] || [ "$fix" == "Y" ]; then
+                cp synapse_data/homeserver.yaml synapse_data/homeserver.yaml.bak
+                # Use perl for safer multiline replacement if sed varies, but standard sed usually works
+                # We look for 'type: http' and append 'x_forwarded: true' with correct indentation (4 spaces)
+                sed -i 's/type: http/type: http\n    x_forwarded: true/' synapse_data/homeserver.yaml
+                success "Configuration patched"
+                log "Restarting Synapse..."
+                docker-compose restart synapse-app
+            fi
+        fi
+    else
+        error "homeserver.yaml not found"
+    fi
+    
+    # 3. Check Federation Port
+    echo ""
+    info "Checking Federation Port (8448)..."
+    if docker-compose ps | grep -q "8448->8448"; then
+        success "Port 8448 mapped in Docker"
+    else
+        warning "Port 8448 not found in Docker mapping"
+    fi
+    
+    echo ""
+    info "💡 Recommendation: If issues persist after fixing DNS/Config:"
+    echo "   Run: sudo ./matrix-manager.sh system recreate"
 }
 
 # Backup and maintenance functions
@@ -584,7 +675,7 @@ server {
 
     location ~ ^(/_matrix|/_synapse/client) {
         proxy_pass http://synapse-app:8008;
-        proxy_set_header Host \$host;
+        proxy_set_header Host $DOMAIN;
         proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         
@@ -623,7 +714,7 @@ server {
 
     location ~ ^(/_matrix|/_synapse/client) {
         proxy_pass http://synapse-app:8008;
-        proxy_set_header Host \$host;
+        proxy_set_header Host $DOMAIN;
         proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         
@@ -939,7 +1030,11 @@ show_help() {
     echo "  system start                                - Start all services"
     echo "  system stop                                 - Stop all services"
     echo "  system restart                              - Restart all services"
+    echo "  system recreate                             - Recreate containers (fix network issues)"
     echo "  system update                               - Update container images"
+    echo ""
+    echo "Troubleshooting:"
+    echo "  troubleshoot                                - Run diagnostics and auto-fix issues"
     echo ""
     echo "Domain Management:"
     echo "  domain change [new-domain] [email]         - Change server domain"
@@ -989,8 +1084,12 @@ main() {
                 "stop") system_stop ;;
                 "restart") system_restart ;;
                 "update") system_update ;;
+                "recreate") system_recreate ;;
                 *) echo "Unknown system action: $2"; show_help ;;
             esac
+            ;;
+        "troubleshoot")
+            troubleshoot
             ;;
         "domain")
             case "$2" in
