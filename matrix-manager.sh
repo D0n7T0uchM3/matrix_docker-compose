@@ -184,6 +184,241 @@ user_reset_password() {
     }
 }
 
+# Normalize username input: strips '@' prefix and ':domain' suffix.
+# Echoes the bare local part (e.g. "alice" from "@alice:example.com").
+_normalize_username() {
+    local raw="$1"
+    echo "$raw" | sed -e 's/^@//' -e 's/:.*$//' | xargs
+}
+
+# Acquire an admin access token by calling /_matrix/client/v3/login from
+# inside synapse-app. Echoes the token on stdout, returns non-zero on failure.
+# Reads admin_user and admin_pass from caller's scope.
+_get_admin_token() {
+    local admin_user="$1"
+    local admin_pass="$2"
+    docker exec -i \
+        -e MX_ADMIN_USER="$admin_user" \
+        -e MX_ADMIN_PASS="$admin_pass" \
+        synapse-app python3 - <<'PY' 2>/dev/null
+import os, sys, json, urllib.request, urllib.error
+body = json.dumps({
+    "type": "m.login.password",
+    "identifier": {"type": "m.id.user", "user": os.environ["MX_ADMIN_USER"]},
+    "password": os.environ["MX_ADMIN_PASS"],
+    "initial_device_display_name": "matrix-manager.sh",
+}).encode()
+req = urllib.request.Request(
+    "http://localhost:8008/_matrix/client/v3/login",
+    data=body, method="POST",
+    headers={"Content-Type": "application/json"},
+)
+try:
+    resp = urllib.request.urlopen(req, timeout=10)
+    token = json.loads(resp.read()).get("access_token", "")
+    if not token:
+        sys.exit(2)
+    print(token)
+except urllib.error.HTTPError as e:
+    sys.exit(3)
+except Exception:
+    sys.exit(4)
+PY
+}
+
+# Verify that the access token belongs to a server admin.
+# Returns 0 if admin, non-zero otherwise.
+_verify_admin_token() {
+    local token="$1"
+    local mxid="$2"
+    docker exec -i \
+        -e MX_TOKEN="$token" \
+        -e MX_MXID="$mxid" \
+        synapse-app python3 - <<'PY' >/dev/null 2>&1
+import os, sys, json, urllib.request, urllib.error
+req = urllib.request.Request(
+    f"http://localhost:8008/_synapse/admin/v1/users/{os.environ['MX_MXID']}/admin",
+    headers={"Authorization": "Bearer " + os.environ["MX_TOKEN"]},
+)
+try:
+    r = urllib.request.urlopen(req, timeout=10)
+    data = json.loads(r.read())
+    sys.exit(0 if data.get("admin") else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+user_delete() {
+    local username="${1:-}"
+    local erase_flag="${2:-}"   # "yes" / "no" / "" (ask)
+
+    # Prompt for username if not given
+    if [ -z "$username" ]; then
+        read -p "Enter username to delete (without @ or :domain): " username
+    fi
+    username=$(_normalize_username "$username")
+    if [ -z "$username" ]; then
+        error "Username cannot be empty"
+        return 1
+    fi
+
+    local mxid="@${username}:${DOMAIN}"
+
+    # Check Synapse is running
+    if ! docker ps --format '{{.Names}}' | grep -qx 'synapse-app'; then
+        error "synapse-app container is not running. Start it: sudo $0 system start"
+        return 1
+    fi
+
+    # Check user existence and current state via the database
+    local user_state
+    user_state=$(docker exec synapse-db psql -U synapse -d synapse -tAc \
+        "SELECT name || '|' || COALESCE(admin::text,'0') || '|' || COALESCE(deactivated::text,'0') FROM users WHERE name='${mxid}';" 2>/dev/null \
+        | tr -d ' ' | head -1)
+
+    if [ -z "$user_state" ]; then
+        error "User $mxid does not exist in the database"
+        info "List all users: sudo $0 user list"
+        return 1
+    fi
+
+    local is_admin=$(echo "$user_state" | cut -d'|' -f2)
+    local is_deactivated=$(echo "$user_state" | cut -d'|' -f3)
+
+    info "Target user:  $mxid"
+    info "  admin:       $([ "$is_admin" = "1" ] && echo yes || echo no)"
+    info "  deactivated: $([ "$is_deactivated" = "1" ] && echo yes || echo no)"
+
+    if [ "$is_deactivated" = "1" ]; then
+        warning "User $mxid is already deactivated."
+        read -p "Continue anyway (e.g. to request erasure)? (y/N): " keep_going
+        if [ "$keep_going" != "y" ] && [ "$keep_going" != "Y" ]; then
+            info "Cancelled"
+            return 0
+        fi
+    fi
+
+    # Ask about erase mode if not pre-specified
+    if [ "$erase_flag" != "yes" ] && [ "$erase_flag" != "no" ]; then
+        echo ""
+        info "Deletion modes:"
+        echo "  1) Deactivate (recommended)"
+        echo "     - Logs the user out of all sessions"
+        echo "     - Clears password and 3PIDs (email/phone)"
+        echo "     - Removes from all rooms"
+        echo "     - Past messages remain attributed to the (deactivated) account"
+        echo ""
+        echo "  2) Deactivate + Erase (GDPR right-to-be-forgotten)"
+        echo "     - Everything in mode 1, plus"
+        echo "     - Marks the account for data erasure"
+        echo "     - Requests deletion of media uploaded by the user"
+        echo ""
+        read -p "Choose [1/2] (default 1): " mode
+        case "$mode" in
+            2) erase_flag="yes" ;;
+            *) erase_flag="no" ;;
+        esac
+    fi
+
+    # Hard confirmation: user must retype the local part
+    echo ""
+    warning "About to deactivate $mxid (erase=$erase_flag)"
+    warning "This action is IRREVERSIBLE."
+    read -p "Type the username '$username' to confirm: " confirm
+    if [ "$confirm" != "$username" ]; then
+        info "Confirmation did not match - cancelled"
+        return 0
+    fi
+
+    # Obtain admin token. Allow ADMIN_TOKEN env var to skip the login step.
+    local token=""
+    if [ -n "${ADMIN_TOKEN:-}" ]; then
+        token="$ADMIN_TOKEN"
+        info "Using ADMIN_TOKEN from environment"
+    else
+        local admin_user="${ADMIN_USER:-admin}"
+        read -p "Admin username [$admin_user]: " input_user
+        admin_user="${input_user:-$admin_user}"
+        read -s -p "Admin password for $admin_user: " admin_pass
+        echo ""
+        if [ -z "$admin_pass" ]; then
+            error "Admin password cannot be empty"
+            return 1
+        fi
+
+        log "Logging in as $admin_user to obtain access token..."
+        token=$(_get_admin_token "$admin_user" "$admin_pass")
+        if [ -z "$token" ]; then
+            error "Failed to log in as $admin_user. Wrong password, account deactivated, or Synapse unreachable."
+            return 1
+        fi
+        success "Login successful"
+
+        local admin_mxid="@${admin_user}:${DOMAIN}"
+        if ! _verify_admin_token "$token" "$admin_mxid"; then
+            error "$admin_mxid is not a server admin - cannot deactivate other users"
+            info "Promote to admin: docker exec synapse-db psql -U synapse -d synapse -c \"UPDATE users SET admin=1 WHERE name='$admin_mxid';\""
+            return 1
+        fi
+        success "Confirmed $admin_mxid is a server admin"
+    fi
+
+    # Call the deactivate API
+    log "Calling POST /_synapse/admin/v1/deactivate/$mxid (erase=$erase_flag)..."
+    local http_code
+    http_code=$(docker exec -i \
+        -e MX_TOKEN="$token" \
+        -e MX_MXID="$mxid" \
+        -e MX_ERASE="$erase_flag" \
+        synapse-app python3 - <<'PY' 2>&1
+import os, sys, json, urllib.request, urllib.error
+body = json.dumps({"erase": os.environ["MX_ERASE"] == "yes"}).encode()
+req = urllib.request.Request(
+    f"http://localhost:8008/_synapse/admin/v1/deactivate/{os.environ['MX_MXID']}",
+    data=body, method="POST",
+    headers={
+        "Authorization": "Bearer " + os.environ["MX_TOKEN"],
+        "Content-Type": "application/json",
+    },
+)
+try:
+    r = urllib.request.urlopen(req, timeout=60)
+    data = json.loads(r.read() or b"{}")
+    print(f"OK {r.status} {json.dumps(data)}")
+except urllib.error.HTTPError as e:
+    body = e.read().decode(errors='replace')
+    print(f"HTTP {e.code} {body}")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERR 0 {e}")
+    sys.exit(2)
+PY
+)
+
+    if echo "$http_code" | grep -q '^OK '; then
+        success "User $mxid deactivated successfully"
+        if [ "$erase_flag" = "yes" ]; then
+            success "User marked for data erasure"
+        fi
+        info "Response: $(echo "$http_code" | sed 's/^OK //')"
+
+        # Re-query DB to confirm
+        local now_deact
+        now_deact=$(docker exec synapse-db psql -U synapse -d synapse -tAc \
+            "SELECT deactivated FROM users WHERE name='${mxid}';" 2>/dev/null | tr -d ' ')
+        if [ "$now_deact" = "1" ]; then
+            success "DB confirms deactivated=1 for $mxid"
+        else
+            warning "DB still shows deactivated=$now_deact (might lag briefly)"
+        fi
+    else
+        error "Deactivation failed"
+        echo "  $http_code"
+        return 1
+    fi
+}
+
 # System management functions
 system_status() {
     echo -e "${CYAN}📊 Matrix Synapse System Status${NC}"
@@ -1024,6 +1259,7 @@ show_help() {
     echo "  user create [username] [password] [admin]  - Create a new user"
     echo "  user list                                   - List all users"
     echo "  user reset-password [username]             - Reset user password"
+    echo "  user delete [username] [erase=yes|no]      - Deactivate (or erase) a user"
     echo ""
     echo "System Management:"
     echo "  system status                               - Show system status"
@@ -1054,6 +1290,10 @@ show_help() {
     echo ""
     echo "Examples:"
     echo "  $0 user create alice password123 no"
+    echo "  $0 user delete alice                 # interactive: choose deactivate vs erase"
+    echo "  $0 user delete alice no              # deactivate only (keep messages)"
+    echo "  $0 user delete alice yes             # deactivate + GDPR erasure"
+    echo "  ADMIN_TOKEN=syt_xxx $0 user delete alice yes   # skip interactive admin login"
     echo "  $0 system status"
     echo "  $0 domain change newdomain.com admin@newdomain.com"
     echo "  $0 backup create"
@@ -1074,6 +1314,7 @@ main() {
                 "create") user_create "$3" "$4" "$5" ;;
                 "list") user_list ;;
                 "reset-password") user_reset_password "$3" ;;
+                "delete"|"deactivate"|"remove") user_delete "$3" "$4" ;;
                 *) echo "Unknown user action: $2"; show_help ;;
             esac
             ;;
